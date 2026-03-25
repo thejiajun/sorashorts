@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 from flask import Flask, render_template, request, jsonify, make_response
 from flask_cors import CORS
 from anthropic import Anthropic
+from supabase import create_client
 
 load_dotenv()
 
@@ -25,6 +26,10 @@ log = app.logger
 
 FAL_KEY = os.environ.get("FAL_KEY")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
 
 APP_VERSION = "2025-02-22-v3"
 
@@ -51,7 +56,35 @@ def health():
         "version": APP_VERSION,
         "fal_key_set": bool(FAL_KEY),
         "anthropic_key_set": bool(ANTHROPIC_API_KEY),
+        "supabase_set": bool(supabase),
     })
+
+
+# Hardcoded fallback when Supabase is not configured
+_FALLBACK_SHOWS = [
+    {"name": "Fifty Shades of Grey", "poster_url": "https://image.tmdb.org/t/p/w500/63kGofUkt1Mx0SIL4XI4Z5AoSgt.jpg"},
+    {"name": "Twilight", "poster_url": "https://image.tmdb.org/t/p/w500/3Gkb6jm6962ADUPaCBqzz9CTbn9.jpg"},
+    {"name": "Crash Landing on You", "poster_url": "https://image.tmdb.org/t/p/w500/fgBNLPr6mC8pxuR79ENAJY4nBmj.jpg"},
+    {"name": "Eternal Love", "poster_url": "https://image.tmdb.org/t/p/w500/paeDktO7Bx2lmv9mEDiHtneoYrF.jpg"},
+    {"name": "Crazy Rich Asians", "poster_url": "https://image.tmdb.org/t/p/w500/1XxL4LJ5WHdrcYcihEZUCgNCpAW.jpg"},
+    {"name": "My Love from the Star", "poster_url": "https://image.tmdb.org/t/p/w500/o5EYVYCVtDUdajP4rWfv6q0BTmm.jpg"},
+    {"name": "Bridgerton", "poster_url": "https://image.tmdb.org/t/p/w500/uXTg565ahu9RwonCX1V2Hex1NU6.jpg"},
+    {"name": "Single's Inferno", "poster_url": "https://image.tmdb.org/t/p/w500/86zkkFCrNc4VeqvCANTmpGNgFEF.jpg"},
+]
+
+
+@app.route("/api/shows")
+def list_shows():
+    """Fetch shows from Supabase, fall back to hardcoded list."""
+    if supabase:
+        try:
+            result = supabase.table("shows").select("name, poster_url").order("sort_order").execute()
+            if result.data:
+                return jsonify({"shows": result.data})
+        except Exception as e:
+            log.error(f"[SHOWS] Supabase error: {e}")
+
+    return jsonify({"shows": _FALLBACK_SHOWS})
 
 
 @app.route("/api/detect-gender", methods=["POST"])

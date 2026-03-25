@@ -254,22 +254,53 @@ els.continueBtn.addEventListener("click", async () => {
 });
 
 // ===== SHOW SELECTION =====
-// Shuffle show cards randomly
-const showsGrid = document.querySelector(".shows-grid");
-const showCards = [...showsGrid.querySelectorAll(".show-card")];
-for (let i = showCards.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    showsGrid.appendChild(showCards[j]);
-    showCards[j] = showCards[i];
-}
+const showsGrid = document.getElementById("shows-grid");
 
-// Clicking a show card
-document.querySelectorAll(".show-card").forEach((card) => {
+function createShowCard(show) {
+    const card = document.createElement("div");
+    card.className = "show-card";
+    card.dataset.show = show.name;
+    card.innerHTML = `
+        <div class="show-poster">
+            <img src="${show.poster_url}" alt="${show.name}">
+            <div class="show-overlay">
+                <div class="play-icon">
+                    <svg width="48" height="48" viewBox="0 0 24 24" fill="white">
+                        <polygon points="5,3 19,12 5,21"/>
+                    </svg>
+                </div>
+            </div>
+        </div>
+        <p class="show-title">${show.name}</p>`;
     card.addEventListener("click", () => {
-        selectedShow = card.dataset.show;
+        selectedShow = show.name;
         startGeneration();
     });
-});
+    return card;
+}
+
+// Shuffle array in place
+function shuffle(arr) {
+    for (let i = arr.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+}
+
+async function loadShows() {
+    try {
+        const resp = await fetch("/api/shows");
+        const data = await resp.json();
+        const shows = shuffle(data.shows || []);
+        showsGrid.innerHTML = "";
+        shows.forEach((show) => showsGrid.appendChild(createShowCard(show)));
+    } catch (err) {
+        console.error("Failed to load shows:", err);
+    }
+}
+
+loadShows();
 
 // Custom show input
 els.customShowBtn.addEventListener("click", () => {
