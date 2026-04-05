@@ -10,6 +10,184 @@ let currentClipIndex = 0; // which clip we're generating
 let actData = []; // [{act_number, title, prompt, scenes, imageURL}, ...]
 let photoToken = null; // cached for image gen calls
 let userName = null; // user's name for storyboard
+let savedPhotoUrl = null; // URL of a saved photo selected by the user
+
+// ===== SUPABASE AUTH =====
+let supabaseClient = null;
+let currentUser = null;
+let pendingAuthCallback = null;
+
+async function initSupabase() {
+    try {
+        const resp = await fetch('/api/config');
+        const config = await resp.json();
+        if (!config.supabase_url || !config.supabase_anon_key) {
+            console.warn('Supabase config not available');
+            return;
+        }
+        supabaseClient = supabase.createClient(config.supabase_url, config.supabase_anon_key);
+
+        // Check for existing session
+        const { data: { session } } = await supabaseClient.auth.getSession();
+        if (session) {
+            currentUser = session.user;
+            onAuthStateChanged(session.user);
+        }
+
+        // Listen for auth changes
+        supabaseClient.auth.onAuthStateChange((event, session) => {
+            currentUser = session?.user || null;
+            onAuthStateChanged(currentUser);
+        });
+    } catch (err) {
+        console.error('Failed to init Supabase:', err);
+    }
+
+    // Show auth button after init
+    document.getElementById('auth-btn').style.display = '';
+}
+
+async function getAuthToken() {
+    if (!supabaseClient) return null;
+    const { data: { session } } = await supabaseClient.auth.getSession();
+    return session?.access_token || null;
+}
+
+async function authFetch(url, options = {}) {
+    const token = await getAuthToken();
+    const headers = { ...options.headers };
+    // Only set Content-Type to JSON if not already set and no FormData body
+    if (!headers["Content-Type"] && !(options.body instanceof FormData)) {
+        headers["Content-Type"] = "application/json";
+    }
+    if (token) {
+        headers["Authorization"] = `Bearer ${token}`;
+    }
+    return fetch(url, { ...options, headers });
+}
+
+async function requireAuthThen(callback) {
+    if (currentUser) {
+        return callback();
+    }
+    // Show login modal, store callback for after login
+    pendingAuthCallback = callback;
+    document.getElementById('login-overlay').style.display = 'flex';
+}
+
+function onAuthStateChanged(user) {
+    const authBtn = document.getElementById('auth-btn');
+    const userMenu = document.getElementById('user-menu');
+
+    if (user) {
+        authBtn.style.display = 'none';
+        userMenu.style.display = 'flex';
+        document.getElementById('user-avatar').src = user.user_metadata?.avatar_url || '';
+        document.getElementById('user-name-display').textContent = user.user_metadata?.full_name || user.email || '';
+
+        // Load saved photos
+        loadSavedPhotos();
+
+        // If there was a pending action after login, execute it
+        if (pendingAuthCallback) {
+            const cb = pendingAuthCallback;
+            pendingAuthCallback = null;
+            document.getElementById('login-overlay').style.display = 'none';
+            cb();
+        }
+    } else {
+        authBtn.style.display = '';
+        userMenu.style.display = 'none';
+        document.getElementById('saved-photos-section').style.display = 'none';
+    }
+}
+
+async function loadSavedPhotos() {
+    if (!currentUser) return;
+
+    try {
+        const resp = await authFetch('/api/user/photos');
+        if (!resp.ok) return;
+        const data = await resp.json();
+
+        const section = document.getElementById('saved-photos-section');
+        const grid = document.getElementById('saved-photos-grid');
+
+        if (!data.photos || data.photos.length === 0) {
+            section.style.display = 'none';
+            return;
+        }
+
+        section.style.display = '';
+        grid.innerHTML = '';
+
+        data.photos.forEach(photo => {
+            const item = document.createElement('div');
+            item.className = 'saved-photo-item';
+            const img = document.createElement('img');
+            img.src = photo.url;
+            img.alt = 'Saved photo';
+            img.addEventListener('click', async () => {
+                // Download saved photo and convert to data URI for compatibility
+                try {
+                    const resp = await fetch(photo.url);
+                    const blob = await resp.blob();
+                    const reader = new FileReader();
+                    reader.onload = async (e) => {
+                        userPhotoDataURI = await compressImage(e.target.result, 800, 0.8);
+                        savedPhotoUrl = null;
+                        els.photoPreview.src = userPhotoDataURI;
+                        els.uploadArea.style.display = 'none';
+                        els.previewContainer.style.display = 'block';
+                    };
+                    reader.readAsDataURL(blob);
+                } catch (err) {
+                    console.error('Failed to load saved photo:', err);
+                    showError('Failed to load saved photo');
+                }
+            });
+            item.appendChild(img);
+            grid.appendChild(item);
+        });
+    } catch (err) {
+        console.error('Failed to load saved photos:', err);
+    }
+}
+
+async function saveProject() {
+    if (!currentUser) return;
+
+    try {
+        const assets = [];
+        for (let i = 0; i < actData.length; i++) {
+            if (actData[i].imageURL) {
+                assets.push({ act_number: i + 1, asset_type: 'image', url: actData[i].imageURL });
+            }
+            if (generatedClips[i]) {
+                assets.push({ act_number: i + 1, asset_type: 'video', url: generatedClips[i] });
+            }
+        }
+
+        const resp = await authFetch('/api/save-project', {
+            method: 'POST',
+            body: JSON.stringify({
+                show_name: selectedShow,
+                user_name: userName,
+                gender: detectedGender,
+                storyboard: actData,
+                assets: assets,
+            }),
+        });
+        if (!resp.ok) {
+            const errData = await resp.json().catch(() => ({}));
+            console.error('Failed to save project:', errData.error || resp.status);
+            return;
+        }
+        console.log('Project saved successfully');
+    } catch (err) {
+        console.error('Failed to save project:', err);
+    }
+}
 
 // ===== DOM REFS =====
 const screens = {
@@ -33,7 +211,7 @@ const els = {
     retakeBtn: document.getElementById("retake-btn"),
     continueBtn: document.getElementById("continue-btn"),
     userNameInput: document.getElementById("user-name-input"),
-    navPhoto: document.getElementById("nav-photo"),
+    // navPhoto removed - replaced by global auth bar
     customShowInput: document.getElementById("custom-show"),
     customShowBtn: document.getElementById("custom-show-btn"),
     storyboard: document.getElementById("storyboard"),
@@ -207,6 +385,7 @@ els.uploadArea.addEventListener("drop", (e) => {
 // Retake / Continue
 els.retakeBtn.addEventListener("click", () => {
     userPhotoDataURI = null;
+    savedPhotoUrl = null;
     els.photoPreview.src = "";
     els.previewContainer.style.display = "none";
     els.uploadArea.style.display = "block";
@@ -214,7 +393,7 @@ els.retakeBtn.addEventListener("click", () => {
 });
 
 els.continueBtn.addEventListener("click", async () => {
-    if (!userPhotoDataURI) return;
+    if (!userPhotoDataURI && !savedPhotoUrl) return;
 
     // Read user name
     const nameVal = els.userNameInput.value.trim();
@@ -249,34 +428,64 @@ els.continueBtn.addEventListener("click", async () => {
 
     els.continueBtn.textContent = origText;
     els.continueBtn.disabled = false;
-    els.navPhoto.style.backgroundImage = `url(${userPhotoDataURI})`;
     showScreen("select");
 });
 
 // ===== SHOW SELECTION =====
-// Shuffle show cards randomly
-const showsGrid = document.querySelector(".shows-grid");
-const showCards = [...showsGrid.querySelectorAll(".show-card")];
-for (let i = showCards.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    showsGrid.appendChild(showCards[j]);
-    showCards[j] = showCards[i];
+const showsGrid = document.getElementById("shows-grid");
+
+function createShowCard(show) {
+    const card = document.createElement("div");
+    card.className = "show-card";
+    card.dataset.show = show.name;
+    card.innerHTML = `
+        <div class="show-poster">
+            <img src="${show.poster_url}" alt="${show.name}">
+            <div class="show-overlay">
+                <div class="play-icon">
+                    <svg width="48" height="48" viewBox="0 0 24 24" fill="white">
+                        <polygon points="5,3 19,12 5,21"/>
+                    </svg>
+                </div>
+            </div>
+        </div>
+        <p class="show-title">${show.name}</p>`;
+    card.addEventListener("click", () => {
+        selectedShow = show.name;
+        requireAuthThen(() => startGeneration());
+    });
+    return card;
 }
 
-// Clicking a show card
-document.querySelectorAll(".show-card").forEach((card) => {
-    card.addEventListener("click", () => {
-        selectedShow = card.dataset.show;
-        startGeneration();
-    });
-});
+// Shuffle array in place
+function shuffle(arr) {
+    for (let i = arr.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+}
+
+async function loadShows() {
+    try {
+        const resp = await fetch("/api/shows");
+        const data = await resp.json();
+        const shows = shuffle(data.shows || []);
+        showsGrid.innerHTML = "";
+        shows.forEach((show) => showsGrid.appendChild(createShowCard(show)));
+    } catch (err) {
+        console.error("Failed to load shows:", err);
+    }
+}
+
+loadShows();
 
 // Custom show input
 els.customShowBtn.addEventListener("click", () => {
     const val = els.customShowInput.value.trim();
     if (!val) return;
     selectedShow = val;
-    startGeneration();
+    requireAuthThen(() => startGeneration());
 });
 
 els.customShowInput.addEventListener("keydown", (e) => {
@@ -284,7 +493,7 @@ els.customShowInput.addEventListener("keydown", (e) => {
         const val = els.customShowInput.value.trim();
         if (!val) return;
         selectedShow = val;
-        startGeneration();
+        requireAuthThen(() => startGeneration());
     }
 });
 
@@ -491,9 +700,8 @@ async function generateActVideo(actNumber) {
 
     try {
         // Step 1: Call Opus to expand scene descriptions into detailed video prompt
-        const expandResp = await fetch("/api/expand-video-prompt", {
+        const expandResp = await authFetch("/api/expand-video-prompt", {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
                 show_name: selectedShow,
                 act_title: act.title,
@@ -533,9 +741,8 @@ async function generateActVideo(actNumber) {
         };
         console.log(`[VIDEO] Act ${actNumber} sending to /api/generate-video:`, JSON.stringify(videoPayload).substring(0, 500));
 
-        const resp = await fetch("/api/generate-video", {
+        const resp = await authFetch("/api/generate-video", {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
             body: JSON.stringify(videoPayload),
         });
 
@@ -663,9 +870,8 @@ async function startGeneration() {
 
     try {
         // Step 1: Generate 5 act prompts with Claude
-        const storyboardResponse = await fetch("/api/generate-storyboard", {
+        const storyboardResponse = await authFetch("/api/generate-storyboard", {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ show_name: selectedShow, gender: detectedGender, user_name: userName }),
         });
 
@@ -703,15 +909,39 @@ async function startGeneration() {
         els.statusText.textContent = `Generating ${acts.length} act images...`;
         els.statusDetail.textContent = "Preparing image requests...";
 
-        // Upload photo once
-        const uploadResp = await fetch("/api/upload-photo", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ photo: userPhotoDataURI }),
-        });
-        if (!uploadResp.ok) throw new Error("Failed to upload photo");
-        const uploadData = await uploadResp.json();
-        photoToken = uploadData.photo_token;
+        // Upload photo once (use saved photo URL or data URI)
+        const photoPayload = savedPhotoUrl
+            ? { photo_url: savedPhotoUrl }
+            : { photo: userPhotoDataURI };
+
+        if (currentUser && userPhotoDataURI) {
+            // If logged in and has a new photo, save it to user's collection
+            const uploadResp = await authFetch("/api/user/upload-photo", {
+                method: "POST",
+                body: JSON.stringify({ photo: userPhotoDataURI }),
+            });
+            if (uploadResp.ok) {
+                const uploadData = await uploadResp.json();
+                photoToken = uploadData.photo_token;
+            } else {
+                // Fallback to regular upload
+                const fallbackResp = await authFetch("/api/upload-photo", {
+                    method: "POST",
+                    body: JSON.stringify(photoPayload),
+                });
+                if (!fallbackResp.ok) throw new Error("Failed to upload photo");
+                const fallbackData = await fallbackResp.json();
+                photoToken = fallbackData.photo_token;
+            }
+        } else {
+            const uploadResp = await authFetch("/api/upload-photo", {
+                method: "POST",
+                body: JSON.stringify(photoPayload),
+            });
+            if (!uploadResp.ok) throw new Error("Failed to upload photo");
+            const uploadData = await uploadResp.json();
+            photoToken = uploadData.photo_token;
+        }
 
         els.statusDetail.textContent = "Submitting image requests...";
 
@@ -719,9 +949,8 @@ async function startGeneration() {
         const submissions = await Promise.all(
             acts.map(async (act, i) => {
                 const actNum = act.act_number || i + 1;
-                const submitResponse = await fetch("/api/generate-image", {
+                const submitResponse = await authFetch("/api/generate-image", {
                     method: "POST",
-                    headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({
                         photo_token: photoToken,
                         prompt: act.prompt,
@@ -901,9 +1130,8 @@ async function generateClip(index) {
         // Use the scene prompt for this clip
         const scenePrompt = scenePrompts[index] || `Scene ${index + 1}`;
 
-        const videoResponse = await fetch("/api/generate-video", {
+        const videoResponse = await authFetch("/api/generate-video", {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
                 image_url: generatedImages[index],
                 prompt: scenePrompt,
@@ -993,6 +1221,8 @@ function onClipReady(index, videoUrl) {
     const readyCount = generatedClips.filter(Boolean).length;
 
     if (isLastClip) {
+        // Auto-save project
+        saveProject();
         // All clips done
         els.resultHeading.textContent = "Your Drama Clips Are Ready";
         els.clipActions.style.display = "none";
@@ -1055,6 +1285,7 @@ els.tryagainBtn.addEventListener("click", () => {
     detectedGender = null;
     selectedShow = null;
     userName = null;
+    savedPhotoUrl = null;
     els.clipsTimeline.innerHTML = "";
     els.customShowInput.value = "";
     showScreen("select");
@@ -1073,9 +1304,8 @@ async function mergeClips(btn) {
     btn.disabled = true;
 
     try {
-        const resp = await fetch("/api/merge-clips", {
+        const resp = await authFetch("/api/merge-clips", {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ clip_urls: clipUrls }),
         });
 
@@ -1108,3 +1338,34 @@ async function mergeClips(btn) {
 
 els.mergeClipsBtn.addEventListener("click", () => mergeClips(els.mergeClipsBtn));
 els.mergeAllBtn.addEventListener("click", () => mergeClips(els.mergeAllBtn));
+
+// ===== AUTH UI EVENT LISTENERS =====
+document.getElementById('auth-btn').addEventListener('click', () => {
+    document.getElementById('login-overlay').style.display = 'flex';
+});
+
+document.getElementById('google-login-btn').addEventListener('click', async () => {
+    if (!supabaseClient) return;
+    await supabaseClient.auth.signInWithOAuth({
+        provider: 'google',
+        options: {
+            redirectTo: window.location.origin,
+        }
+    });
+});
+
+document.getElementById('login-close-btn').addEventListener('click', () => {
+    document.getElementById('login-overlay').style.display = 'none';
+    pendingAuthCallback = null;
+});
+
+document.getElementById('logout-btn').addEventListener('click', async () => {
+    if (supabaseClient) {
+        await supabaseClient.auth.signOut();
+    }
+    currentUser = null;
+    onAuthStateChanged(null);
+});
+
+// ===== INIT SUPABASE =====
+initSupabase();

@@ -1,6 +1,8 @@
 flask
 flask-cors
+flask-limiter
 python-dotenv
 requests
 anthropic
 gunicorn
+supabase
