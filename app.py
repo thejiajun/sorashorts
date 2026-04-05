@@ -53,6 +53,17 @@ APP_VERSION = "2025-02-22-v3"
 _photo_cache = {}
 
 
+def require_admin_client(f):
+    """Decorator: reject request if supabase_admin is not configured."""
+    import functools
+    @functools.wraps(f)
+    def decorated(*args, **kwargs):
+        if not supabase_admin:
+            return jsonify({"error": "Storage service not configured"}), 503
+        return f(*args, **kwargs)
+    return decorated
+
+
 def validate_json(*required_fields):
     """Validate request has JSON body with required fields."""
     data = request.get_json(silent=True)
@@ -707,6 +718,7 @@ def merge_clips():
 
 @app.route("/api/user/photos", methods=["GET"])
 @require_auth
+@require_admin_client
 def get_user_photos():
     """Get user's saved photos."""
     result = supabase_admin.table("user_photos").select("*").eq("user_id", g.user_id).order("created_at", desc=True).execute()
@@ -724,6 +736,7 @@ def get_user_photos():
 
 @app.route("/api/user/upload-photo", methods=["POST"])
 @require_auth
+@require_admin_client
 @limiter.limit("10 per hour")
 def upload_user_photo():
     """Upload photo to Supabase Storage and save record."""
@@ -779,6 +792,7 @@ def upload_user_photo():
 
 @app.route("/api/user/projects", methods=["GET"])
 @require_auth
+@require_admin_client
 def get_user_projects():
     """Get user's project history."""
     result = supabase_admin.table("projects").select("id, show_name, user_name, gender, created_at").eq("user_id", g.user_id).order("created_at", desc=True).limit(20).execute()
@@ -805,6 +819,7 @@ def get_user_projects():
 
 @app.route("/api/user/projects/<project_id>", methods=["GET"])
 @require_auth
+@require_admin_client
 def get_user_project(project_id):
     """Get a single project with all assets."""
     result = supabase_admin.table("projects").select("*").eq("id", project_id).eq("user_id", g.user_id).limit(1).execute()
@@ -842,6 +857,7 @@ def get_user_project(project_id):
 
 @app.route("/api/save-project", methods=["POST"])
 @require_auth
+@require_admin_client
 def save_project():
     """Save a completed project with its assets."""
     import base64
@@ -859,6 +875,9 @@ def save_project():
 
     project_id = project_result.data[0]["id"]
 
+    # Allowed domains for asset URLs (prevent SSRF)
+    ALLOWED_ASSET_DOMAINS = {"fal.media", "v3.fal.media", "storage.googleapis.com"}
+
     # Save each asset - download from URL and upload to Storage
     saved_assets = []
     for asset in data["assets"]:
@@ -867,7 +886,15 @@ def save_project():
         url = asset["url"]
 
         try:
-            # Download from fal.ai URL
+            # Validate URL domain to prevent SSRF
+            from urllib.parse import urlparse
+            parsed = urlparse(url)
+            if parsed.scheme not in ("https",) or parsed.hostname not in ALLOWED_ASSET_DOMAINS:
+                log.warning(f"[SAVE-PROJECT] Rejected URL with disallowed domain: {parsed.hostname}")
+                saved_assets.append({"act_number": act_number, "asset_type": asset_type, "status": "rejected"})
+                continue
+
+            # Download from allowed URL
             resp = requests.get(url, timeout=120)
             if resp.status_code != 200:
                 continue
