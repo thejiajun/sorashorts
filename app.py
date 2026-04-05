@@ -10,18 +10,30 @@ import subprocess
 import shutil
 import requests
 from dotenv import load_dotenv
-from flask import Flask, render_template, request, jsonify, make_response
+from flask import Flask, render_template, request, jsonify, make_response, g
 from flask_cors import CORS
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 from anthropic import Anthropic
 from supabase import create_client
+from auth import require_auth, optional_auth
 
 load_dotenv()
 
 app = Flask(__name__)
-CORS(app)
+ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
+CORS(app, origins=ALLOWED_ORIGINS)
 
-# Force unbuffered logging to stderr
-logging.basicConfig(stream=sys.stderr, level=logging.DEBUG)
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=["60 per minute"],
+    storage_uri="memory://",
+)
+
+# Configurable log level via environment variable
+log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(stream=sys.stderr, level=getattr(logging, log_level, logging.INFO))
 log = app.logger
 
 FAL_KEY = os.environ.get("FAL_KEY")
@@ -35,6 +47,17 @@ APP_VERSION = "2025-02-22-v3"
 
 # In-memory cache for uploaded photos (keyed by a simple token)
 _photo_cache = {}
+
+
+def validate_json(*required_fields):
+    """Validate request has JSON body with required fields."""
+    data = request.get_json(silent=True)
+    if not data:
+        return None, (jsonify({"error": "JSON body required"}), 400)
+    missing = [f for f in required_fields if f not in data or not data[f]]
+    if missing:
+        return None, (jsonify({"error": f"Missing fields: {', '.join(missing)}"}), 400)
+    return data, None
 
 
 @app.errorhandler(Exception)
@@ -51,12 +74,15 @@ def index():
 
 @app.route("/api/health")
 def health():
+    return jsonify({"status": "ok", "version": APP_VERSION})
+
+
+@app.route("/api/config")
+def get_config():
+    """Return public Supabase config for frontend auth initialization."""
     return jsonify({
-        "status": "ok",
-        "version": APP_VERSION,
-        "fal_key_set": bool(FAL_KEY),
-        "anthropic_key_set": bool(ANTHROPIC_API_KEY),
-        "supabase_set": bool(supabase),
+        "supabase_url": SUPABASE_URL or "",
+        "supabase_anon_key": SUPABASE_KEY or "",
     })
 
 
@@ -88,9 +114,16 @@ def list_shows():
 
 
 @app.route("/api/detect-gender", methods=["POST"])
+@limiter.limit("20 per hour")
+@require_auth
 def detect_gender():
-    data = request.json
-    photo = data["photo"]  # base64 data URI
+    data, err = validate_json("photo")
+    if err: return err
+    photo = data["photo"]
+
+    # Validate photo is a data URI
+    if not photo.startswith("data:image/"):
+        return jsonify({"error": "Invalid photo format"}), 400
 
     # Parse the data URI to extract media type and base64 data
     # Format: data:image/jpeg;base64,/9j/4AAQ...
@@ -134,8 +167,11 @@ def detect_gender():
 
 
 @app.route("/api/generate-storyboard", methods=["POST"])
+@limiter.limit("10 per hour")
+@require_auth
 def generate_storyboard():
-    data = request.json
+    data, err = validate_json("show_name")
+    if err: return err
     show_name = data["show_name"]
     gender = data.get("gender", "male")
     user_name = data.get("user_name", "the protagonist")
@@ -228,9 +264,12 @@ def generate_storyboard():
 
 
 @app.route("/api/expand-video-prompt", methods=["POST"])
+@limiter.limit("10 per hour")
+@require_auth
 def expand_video_prompt():
     """Use Opus to expand 4 scene descriptions into a detailed Sora 2 video prompt."""
-    data = request.json
+    data, err = validate_json("show_name", "act_title", "scenes")
+    if err: return err
     show_name = data["show_name"]
     act_title = data["act_title"]
     scenes = data["scenes"]  # array of 4 short scene strings
@@ -285,10 +324,12 @@ def expand_video_prompt():
 
 
 @app.route("/api/upload-photo", methods=["POST"])
+@require_auth
 def upload_photo():
     """Cache the user's photo and return a token to reference it."""
     import uuid
-    data = request.json
+    data, err = validate_json("photo")
+    if err: return err
     photo = data["photo"]
     token = str(uuid.uuid4())
     _photo_cache[token] = photo
@@ -297,9 +338,11 @@ def upload_photo():
 
 
 @app.route("/api/generate-image", methods=["POST"])
+@limiter.limit("30 per hour")
+@require_auth
 def generate_image():
     """Submit image generation to fal.ai queue, return request_id for client polling."""
-    data = request.json
+    data = request.get_json(silent=True) or {}
     # Support both direct photo and cached photo token
     user_photo = data.get("photo")
     if not user_photo:
@@ -359,6 +402,7 @@ def generate_image():
 
 
 @app.route("/api/image-status/<request_id>")
+@limiter.limit("120 per minute")
 def image_status(request_id):
     response = requests.get(
         f"https://queue.fal.run/fal-ai/nano-banana-2/requests/{request_id}/status",
@@ -373,6 +417,7 @@ def image_status(request_id):
 
 
 @app.route("/api/image-result/<request_id>")
+@limiter.limit("120 per minute")
 def image_result(request_id):
     response = requests.get(
         f"https://queue.fal.run/fal-ai/nano-banana-2/requests/{request_id}",
@@ -387,8 +432,10 @@ def image_result(request_id):
 
 
 @app.route("/api/generate-scene-prompt", methods=["POST"])
+@require_auth
 def generate_scene_prompt():
-    data = request.json
+    data, err = validate_json("show_name")
+    if err: return err
     show_name = data["show_name"]
 
     client = Anthropic(api_key=ANTHROPIC_API_KEY, timeout=600.0)
@@ -517,8 +564,10 @@ def sanitize_sora_prompt(prompt: str) -> str:
 
 
 @app.route("/api/generate-video", methods=["POST"])
+@limiter.limit("10 per hour")
+@require_auth
 def generate_video():
-    data = request.json
+    data = request.get_json(silent=True) or {}
     image_url = data["image_url"]
     prompt = data.get("prompt", "")
 
@@ -566,6 +615,7 @@ def generate_video():
 
 
 @app.route("/api/video-status/<request_id>")
+@limiter.limit("120 per minute")
 def video_status(request_id):
     response = requests.get(
         f"https://queue.fal.run/fal-ai/sora-2/requests/{request_id}/status",
@@ -579,6 +629,7 @@ def video_status(request_id):
 
 
 @app.route("/api/video-result/<request_id>")
+@limiter.limit("120 per minute")
 def video_result(request_id):
     response = requests.get(
         f"https://queue.fal.run/fal-ai/sora-2/requests/{request_id}",
@@ -592,9 +643,10 @@ def video_result(request_id):
 
 
 @app.route("/api/merge-clips", methods=["POST"])
+@require_auth
 def merge_clips():
     """Download clip videos and merge them into a single MP4 using ffmpeg."""
-    data = request.json
+    data = request.get_json(silent=True) or {}
     clip_urls = data.get("clip_urls", [])
 
     if len(clip_urls) < 2:
@@ -648,6 +700,200 @@ def merge_clips():
         return jsonify({"error": str(e)}), 500
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+@app.route("/api/user/photos", methods=["GET"])
+@require_auth
+def get_user_photos():
+    """Get user's saved photos."""
+    result = supabase.table("user_photos").select("*").eq("user_id", g.user_id).order("created_at", desc=True).execute()
+    photos = []
+    for row in (result.data or []):
+        # Generate signed URL for each photo
+        signed = supabase.storage.from_("user-photos").create_signed_url(row["storage_path"], 3600)
+        photos.append({
+            "id": row["id"],
+            "url": signed.get("signedURL") or signed.get("signedUrl", ""),
+            "created_at": row["created_at"],
+        })
+    return jsonify({"photos": photos})
+
+
+@app.route("/api/user/upload-photo", methods=["POST"])
+@require_auth
+@limiter.limit("10 per hour")
+def upload_user_photo():
+    """Upload photo to Supabase Storage and save record."""
+    import base64
+    data, err = validate_json("photo")
+    if err: return err
+
+    photo = data["photo"]
+    if not photo.startswith("data:image/"):
+        return jsonify({"error": "Invalid photo format"}), 400
+
+    # Parse data URI
+    header, b64_data = photo.split(",", 1)
+    media_type = header.split(":")[1].split(";")[0]
+    ext = media_type.split("/")[1]
+    if ext == "jpeg": ext = "jpg"
+
+    photo_bytes = base64.b64decode(b64_data)
+
+    # Check size (5MB max)
+    if len(photo_bytes) > 5 * 1024 * 1024:
+        return jsonify({"error": "Photo too large (max 5MB)"}), 400
+
+    import uuid
+    filename = f"{g.user_id}/{uuid.uuid4()}.{ext}"
+
+    # Upload to Supabase Storage
+    supabase.storage.from_("user-photos").upload(
+        filename,
+        photo_bytes,
+        {"content-type": media_type}
+    )
+
+    # Save record
+    supabase.table("user_photos").insert({
+        "user_id": g.user_id,
+        "storage_path": filename,
+    }).execute()
+
+    # Also cache in memory for immediate use during this session
+    token = str(uuid.uuid4())
+    _photo_cache[token] = photo
+
+    # Generate signed URL
+    signed = supabase.storage.from_("user-photos").create_signed_url(filename, 3600)
+
+    return jsonify({
+        "photo_token": token,
+        "photo_url": signed.get("signedURL") or signed.get("signedUrl", ""),
+        "storage_path": filename,
+    })
+
+
+@app.route("/api/user/projects", methods=["GET"])
+@require_auth
+def get_user_projects():
+    """Get user's project history."""
+    result = supabase.table("projects").select("id, show_name, user_name, gender, created_at").eq("user_id", g.user_id).order("created_at", desc=True).limit(20).execute()
+
+    projects = []
+    for row in (result.data or []):
+        # Get first image asset for thumbnail
+        assets = supabase.table("project_assets").select("storage_path").eq("project_id", row["id"]).eq("asset_type", "image").eq("act_number", 1).limit(1).execute()
+        thumbnail_url = ""
+        if assets.data:
+            signed = supabase.storage.from_("project-assets").create_signed_url(assets.data[0]["storage_path"], 3600)
+            thumbnail_url = signed.get("signedURL") or signed.get("signedUrl", "")
+
+        projects.append({
+            "id": row["id"],
+            "show_name": row["show_name"],
+            "user_name": row["user_name"],
+            "created_at": row["created_at"],
+            "thumbnail_url": thumbnail_url,
+        })
+
+    return jsonify({"projects": projects})
+
+
+@app.route("/api/user/projects/<project_id>", methods=["GET"])
+@require_auth
+def get_user_project(project_id):
+    """Get a single project with all assets."""
+    result = supabase.table("projects").select("*").eq("id", project_id).eq("user_id", g.user_id).limit(1).execute()
+    if not result.data:
+        return jsonify({"error": "Project not found"}), 404
+
+    project = result.data[0]
+
+    # Get all assets
+    assets_result = supabase.table("project_assets").select("*").eq("project_id", project_id).order("act_number").execute()
+
+    assets = []
+    for asset in (assets_result.data or []):
+        signed = supabase.storage.from_("project-assets").create_signed_url(asset["storage_path"], 3600)
+        assets.append({
+            "id": asset["id"],
+            "act_number": asset["act_number"],
+            "asset_type": asset["asset_type"],
+            "url": signed.get("signedURL") or signed.get("signedUrl", ""),
+            "created_at": asset["created_at"],
+        })
+
+    return jsonify({
+        "project": {
+            "id": project["id"],
+            "show_name": project["show_name"],
+            "user_name": project["user_name"],
+            "gender": project["gender"],
+            "storyboard": project.get("storyboard_json"),
+            "created_at": project["created_at"],
+        },
+        "assets": assets,
+    })
+
+
+@app.route("/api/save-project", methods=["POST"])
+@require_auth
+def save_project():
+    """Save a completed project with its assets."""
+    import base64
+    data, err = validate_json("show_name", "user_name", "gender", "storyboard", "assets")
+    if err: return err
+
+    # Create project record
+    project_result = supabase.table("projects").insert({
+        "user_id": g.user_id,
+        "show_name": data["show_name"],
+        "user_name": data["user_name"],
+        "gender": data["gender"],
+        "storyboard_json": data["storyboard"],
+    }).execute()
+
+    project_id = project_result.data[0]["id"]
+
+    # Save each asset - download from URL and upload to Storage
+    saved_assets = []
+    for asset in data["assets"]:
+        act_number = asset["act_number"]
+        asset_type = asset["asset_type"]  # "image" or "video"
+        url = asset["url"]
+
+        try:
+            # Download from fal.ai URL
+            resp = requests.get(url, timeout=120)
+            if resp.status_code != 200:
+                continue
+
+            ext = "jpg" if asset_type == "image" else "mp4"
+            import uuid
+            storage_path = f"{g.user_id}/{project_id}/act{act_number}_{asset_type}.{ext}"
+
+            content_type = "image/jpeg" if asset_type == "image" else "video/mp4"
+            supabase.storage.from_("project-assets").upload(
+                storage_path,
+                resp.content,
+                {"content-type": content_type}
+            )
+
+            supabase.table("project_assets").insert({
+                "project_id": project_id,
+                "act_number": act_number,
+                "asset_type": asset_type,
+                "storage_path": storage_path,
+                "original_url": url,
+            }).execute()
+
+            saved_assets.append({"act_number": act_number, "asset_type": asset_type, "status": "saved"})
+        except Exception as e:
+            log.error(f"[SAVE-PROJECT] Failed to save asset act {act_number} {asset_type}: {e}")
+            saved_assets.append({"act_number": act_number, "asset_type": asset_type, "status": "failed"})
+
+    return jsonify({"project_id": project_id, "assets": saved_assets})
 
 
 if __name__ == "__main__":
