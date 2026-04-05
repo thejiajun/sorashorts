@@ -39,9 +39,13 @@ log = app.logger
 FAL_KEY = os.environ.get("FAL_KEY")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")  # anon key, safe for frontend
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")  # service_role key, server-only
 
+# Public client for reading public data (shows list)
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
+# Service-role client for server-side writes that bypass RLS
+supabase_admin = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY) if SUPABASE_URL and SUPABASE_SERVICE_KEY else None
 
 APP_VERSION = "2025-02-22-v3"
 
@@ -115,7 +119,6 @@ def list_shows():
 
 @app.route("/api/detect-gender", methods=["POST"])
 @limiter.limit("20 per hour")
-@require_auth
 def detect_gender():
     data, err = validate_json("photo")
     if err: return err
@@ -706,11 +709,11 @@ def merge_clips():
 @require_auth
 def get_user_photos():
     """Get user's saved photos."""
-    result = supabase.table("user_photos").select("*").eq("user_id", g.user_id).order("created_at", desc=True).execute()
+    result = supabase_admin.table("user_photos").select("*").eq("user_id", g.user_id).order("created_at", desc=True).execute()
     photos = []
     for row in (result.data or []):
         # Generate signed URL for each photo
-        signed = supabase.storage.from_("user-photos").create_signed_url(row["storage_path"], 3600)
+        signed = supabase_admin.storage.from_("user-photos").create_signed_url(row["storage_path"], 3600)
         photos.append({
             "id": row["id"],
             "url": signed.get("signedURL") or signed.get("signedUrl", ""),
@@ -748,14 +751,14 @@ def upload_user_photo():
     filename = f"{g.user_id}/{uuid.uuid4()}.{ext}"
 
     # Upload to Supabase Storage
-    supabase.storage.from_("user-photos").upload(
+    supabase_admin.storage.from_("user-photos").upload(
         filename,
         photo_bytes,
         {"content-type": media_type}
     )
 
     # Save record
-    supabase.table("user_photos").insert({
+    supabase_admin.table("user_photos").insert({
         "user_id": g.user_id,
         "storage_path": filename,
     }).execute()
@@ -765,7 +768,7 @@ def upload_user_photo():
     _photo_cache[token] = photo
 
     # Generate signed URL
-    signed = supabase.storage.from_("user-photos").create_signed_url(filename, 3600)
+    signed = supabase_admin.storage.from_("user-photos").create_signed_url(filename, 3600)
 
     return jsonify({
         "photo_token": token,
@@ -778,15 +781,15 @@ def upload_user_photo():
 @require_auth
 def get_user_projects():
     """Get user's project history."""
-    result = supabase.table("projects").select("id, show_name, user_name, gender, created_at").eq("user_id", g.user_id).order("created_at", desc=True).limit(20).execute()
+    result = supabase_admin.table("projects").select("id, show_name, user_name, gender, created_at").eq("user_id", g.user_id).order("created_at", desc=True).limit(20).execute()
 
     projects = []
     for row in (result.data or []):
         # Get first image asset for thumbnail
-        assets = supabase.table("project_assets").select("storage_path").eq("project_id", row["id"]).eq("asset_type", "image").eq("act_number", 1).limit(1).execute()
+        assets = supabase_admin.table("project_assets").select("storage_path").eq("project_id", row["id"]).eq("asset_type", "image").eq("act_number", 1).limit(1).execute()
         thumbnail_url = ""
         if assets.data:
-            signed = supabase.storage.from_("project-assets").create_signed_url(assets.data[0]["storage_path"], 3600)
+            signed = supabase_admin.storage.from_("project-assets").create_signed_url(assets.data[0]["storage_path"], 3600)
             thumbnail_url = signed.get("signedURL") or signed.get("signedUrl", "")
 
         projects.append({
@@ -804,18 +807,18 @@ def get_user_projects():
 @require_auth
 def get_user_project(project_id):
     """Get a single project with all assets."""
-    result = supabase.table("projects").select("*").eq("id", project_id).eq("user_id", g.user_id).limit(1).execute()
+    result = supabase_admin.table("projects").select("*").eq("id", project_id).eq("user_id", g.user_id).limit(1).execute()
     if not result.data:
         return jsonify({"error": "Project not found"}), 404
 
     project = result.data[0]
 
     # Get all assets
-    assets_result = supabase.table("project_assets").select("*").eq("project_id", project_id).order("act_number").execute()
+    assets_result = supabase_admin.table("project_assets").select("*").eq("project_id", project_id).order("act_number").execute()
 
     assets = []
     for asset in (assets_result.data or []):
-        signed = supabase.storage.from_("project-assets").create_signed_url(asset["storage_path"], 3600)
+        signed = supabase_admin.storage.from_("project-assets").create_signed_url(asset["storage_path"], 3600)
         assets.append({
             "id": asset["id"],
             "act_number": asset["act_number"],
@@ -846,7 +849,7 @@ def save_project():
     if err: return err
 
     # Create project record
-    project_result = supabase.table("projects").insert({
+    project_result = supabase_admin.table("projects").insert({
         "user_id": g.user_id,
         "show_name": data["show_name"],
         "user_name": data["user_name"],
@@ -874,13 +877,13 @@ def save_project():
             storage_path = f"{g.user_id}/{project_id}/act{act_number}_{asset_type}.{ext}"
 
             content_type = "image/jpeg" if asset_type == "image" else "video/mp4"
-            supabase.storage.from_("project-assets").upload(
+            supabase_admin.storage.from_("project-assets").upload(
                 storage_path,
                 resp.content,
                 {"content-type": content_type}
             )
 
-            supabase.table("project_assets").insert({
+            supabase_admin.table("project_assets").insert({
                 "project_id": project_id,
                 "act_number": act_number,
                 "asset_type": asset_type,

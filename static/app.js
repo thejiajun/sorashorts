@@ -127,13 +127,24 @@ async function loadSavedPhotos() {
             const img = document.createElement('img');
             img.src = photo.url;
             img.alt = 'Saved photo';
-            img.addEventListener('click', () => {
-                // Use this saved photo
-                userPhotoDataURI = null;
-                savedPhotoUrl = photo.url;
-                els.photoPreview.src = photo.url;
-                els.uploadArea.style.display = 'none';
-                els.previewContainer.style.display = 'block';
+            img.addEventListener('click', async () => {
+                // Download saved photo and convert to data URI for compatibility
+                try {
+                    const resp = await fetch(photo.url);
+                    const blob = await resp.blob();
+                    const reader = new FileReader();
+                    reader.onload = async (e) => {
+                        userPhotoDataURI = await compressImage(e.target.result, 800, 0.8);
+                        savedPhotoUrl = null;
+                        els.photoPreview.src = userPhotoDataURI;
+                        els.uploadArea.style.display = 'none';
+                        els.previewContainer.style.display = 'block';
+                    };
+                    reader.readAsDataURL(blob);
+                } catch (err) {
+                    console.error('Failed to load saved photo:', err);
+                    showError('Failed to load saved photo');
+                }
             });
             item.appendChild(img);
             grid.appendChild(item);
@@ -157,7 +168,7 @@ async function saveProject() {
             }
         }
 
-        await authFetch('/api/save-project', {
+        const resp = await authFetch('/api/save-project', {
             method: 'POST',
             body: JSON.stringify({
                 show_name: selectedShow,
@@ -167,6 +178,11 @@ async function saveProject() {
                 assets: assets,
             }),
         });
+        if (!resp.ok) {
+            const errData = await resp.json().catch(() => ({}));
+            console.error('Failed to save project:', errData.error || resp.status);
+            return;
+        }
         console.log('Project saved successfully');
     } catch (err) {
         console.error('Failed to save project:', err);
@@ -394,10 +410,10 @@ els.continueBtn.addEventListener("click", async () => {
     els.continueBtn.disabled = true;
 
     try {
-        const photoData = userPhotoDataURI || savedPhotoUrl;
-        const resp = await authFetch("/api/detect-gender", {
+        const resp = await fetch("/api/detect-gender", {
             method: "POST",
-            body: JSON.stringify({ photo: photoData }),
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ photo: userPhotoDataURI }),
         });
         if (resp.ok) {
             const data = await resp.json();
